@@ -13,10 +13,10 @@ app.use(morgan(process.env.LOG_LEVEL === 'debug' ? 'dev' : 'tiny'));
 const PORT = process.env.PORT || 5002;
 const AUDIO_STREAM_ROUTE = process.env.AUDIO_STREAM_ROUTE || '/audio-stream';
 
-// ---- health
+// ---- Health
 app.get('/healthz', (_req, res) => res.type('text/plain').send('ok'));
 
-// ---- Twilio webhook
+// ---- Twilio webhook (robust resolver)
 let twilioVoiceHandler = null;
 try {
   const twilioModule = require('./lib/twilioHandler');
@@ -26,6 +26,7 @@ try {
     twilioModule?.voiceHandler ||
     twilioModule?.handler ||
     twilioModule?.default;
+
   if (typeof twilioVoiceHandler !== 'function') {
     console.error('[startup] twilioHandler export not a function; using 500 fallback');
     twilioVoiceHandler = (_req, res) => res.status(500).type('text/plain').send('twilio handler not configured');
@@ -36,10 +37,18 @@ try {
 }
 app.post('/twilio/voice', twilioVoiceHandler);
 
-// ---- Serve the exported Next.js site at "/"
-const STATIC_DIR = path.join(__dirname, 'web', 'out');           // ⟵ changed from web/public
+// ---- Serve exported Next app from /web/out at "/"
+const STATIC_DIR = path.join(__dirname, 'web', 'out');
 app.use(express.static(STATIC_DIR));
 app.get('/', (_req, res) => {
+  res.sendFile(path.join(STATIC_DIR, 'index.html'));
+});
+
+// Optional: catch-all so any non-API route serves the Next index (prevents "Cannot GET /")
+app.get('*', (req, res, next) => {
+  // don’t swallow API/WS routes
+  const p = req.path || '';
+  if (p.startsWith('/twilio/') || p.startsWith('/healthz') || p.startsWith(AUDIO_STREAM_ROUTE)) return next();
   res.sendFile(path.join(STATIC_DIR, 'index.html'));
 });
 
