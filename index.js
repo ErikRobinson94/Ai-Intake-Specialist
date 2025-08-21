@@ -18,12 +18,29 @@ const AUDIO_STREAM_ROUTE = process.env.AUDIO_STREAM_ROUTE || '/audio-stream';
 // ---- HEALTH ----
 app.get('/healthz', (_req, res) => res.type('text/plain').send('ok'));
 
-// ---- TWILIO VOICE WEBHOOK ----
-const { twilioVoiceHandler } = require('./lib/twilioHandler');
+// ---- TWILIO VOICE WEBHOOK (robust resolver) ----
+let twilioVoiceHandler = null;
+try {
+  const twilioModule = require('./lib/twilioHandler');
+  // support any export style
+  twilioVoiceHandler =
+    (typeof twilioModule === 'function' ? twilioModule : null) ||
+    twilioModule?.twilioVoiceHandler ||
+    twilioModule?.voiceHandler ||
+    twilioModule?.handler ||
+    twilioModule?.default;
+
+  if (typeof twilioVoiceHandler !== 'function') {
+    console.error('[startup] Could not resolve a function export from lib/twilioHandler.js. Falling back to 500 handler.');
+    twilioVoiceHandler = (_req, res) => res.status(500).type('text/plain').send('twilio handler not configured');
+  }
+} catch (e) {
+  console.error('[startup] Failed to require ./lib/twilioHandler:', e?.message || e);
+  twilioVoiceHandler = (_req, res) => res.status(500).type('text/plain').send('twilio handler load error');
+}
 app.post('/twilio/voice', twilioVoiceHandler);
 
 // ---- STATIC WEB DEMO (serve at "/") ----
-// Serves files from web/public so / loads our demo page
 const STATIC_DIR = path.join(__dirname, 'web', 'public');
 app.use(express.static(STATIC_DIR));
 app.get('/', (_req, res) => {
