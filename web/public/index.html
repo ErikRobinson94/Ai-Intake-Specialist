@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>AI Intake Specialist – Web Demo</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; padding: 24px; max-width: 900px; margin: 0 auto; }
+    h1 { margin: 0 0 8px; }
+    .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin: 12px 0; }
+    button { padding: 10px 14px; border-radius: 10px; border: 1px solid #ccc; cursor: pointer; }
+    button[disabled] { opacity: .5; cursor: not-allowed; }
+    .log { border: 1px solid #eee; background: #fafafa; padding: 12px; height: 220px; overflow:auto; white-space: pre-wrap; }
+    .badge { padding: 2px 8px; border-radius: 14px; background: #eee; font-size: 12px; }
+    .pill { padding: 2px 8px; border-radius: 14px; border: 1px solid #ddd; }
+    .kv { display: grid; grid-template-columns: 140px 1fr; gap: 6px 12px; margin-top: 8px; }
+    .kv b { color: #555; }
+    .footer { margin-top: 16px; font-size: 12px; color: #777; }
+  </style>
+</head>
+<body>
+  <h1>AI Intake – Web Demo <span id="status" class="badge">idle</span></h1>
+
+  <div class="row">
+    <label>Avatar voice:</label>
+    <select id="voiceId" class="pill">
+      <option value="1">Voice 1 (VOICE_1_TTS)</option>
+      <option value="2">Voice 2 (VOICE_2_TTS)</option>
+      <option value="3">Voice 3 (VOICE_3_TTS)</option>
+    </select>
+
+    <button id="btnStart">Start Mic</button>
+    <button id="btnStop" disabled>Stop</button>
+  </div>
+
+  <div class="kv">
+    <b>WS URL</b><code id="wsUrl"></code>
+    <b>Mic</b><span id="micInfo">—</span>
+  </div>
+
+  <h3>Transcripts</h3>
+  <div id="log" class="log"></div>
+
+  <div class="footer">
+    Tip: open your browser console for detailed errors if anything fails to start.
+  </div>
+
+  <script>
+    // --- simple logger ---
+    const elLog = document.getElementById('log');
+    const elStat = document.getElementById('status');
+    function log(...args){ const line = args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' '); elLog.textContent += line + '\n'; elLog.scrollTop = elLog.scrollHeight; }
+    function setStatus(s){ elStat.textContent = s; }
+
+    // Build WS URL (same host, route /web-demo/ws, with ?voiceId)
+    function buildWsUrl() {
+      const voiceId = document.getElementById('voiceId').value || '1';
+      const proto = (location.protocol === 'https:') ? 'wss:' : 'ws:';
+      return `${proto}//${location.host}/web-demo/ws?voiceId=${encodeURIComponent(voiceId)}`;
+    }
+    document.getElementById('wsUrl').textContent = buildWsUrl();
+
+    let audioCtx = null;
+    let mediaStream = null;
+    let sourceNode = null;
+    let workletNode = null;
+    let ws = null;
+
+    // Utility: downsample Float32 PCM to 16k 16-bit PCM (mono), 20ms frames
+    function floatTo16BitPCM(float32) {
+      const out = new DataView(new ArrayBuffer(float32.length * 2));
+      let offset = 0;
+      for (let i = 0; i < float32.length; i++, offset += 2) {
+        let s = Math.max(-1, Math.min(1, float32[i]));
+        out.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+      }
+      return out.buffer;
+    }
+    function resamplePCM(inBuf, inRate, outRate) {
+      if (inRate === outRate) return inBuf;
+      const ratio = inRate / outRate;
+      const outLen = Math.round(inBuf.length / ratio);
+      const out = new Float32Array(outLen);
+      for (let i = 0; i < outLen; i++) {
+        const idx = i * ratio;
+        const i0 = Math.floor(idx);
+        const i1 = Math.min(i0 + 1, inBuf.length - 1);
+        const frac = idx - i0;
+        out[i] = inBuf[i0] * (1 - frac) + inBuf[i1] * frac;
+      }
+      return out;
+    }
+
+    async function start() {
+      try {
+        setStatus('starting');
+        const url = buildWsUrl();
+        document.getElementById('wsUrl').textContent = url;
+        ws = new WebSocket(url);
+        ws.binaryType = 'arraybuffer';
+
+        ws.onopen = () => {
+          log('WS open');
+          setStatus('connected');
+        };
+        ws.onclose = () => {
+          log('WS closed');
+          setStatus('idle');
+        };
+        ws.onerror = (e) => log('WS error', e?.message || e);
+
+        ws.onmessage = (evt) => {
+          // Binary = DG TTS PCM16@16k from server; play with AudioContext
+          if (evt.data instanceof ArrayBuffer) {
+            // Create/keep an AudioContext-based player
+            if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+            audioCtx.decodeAudioData(evt.data.slice(0)).then(() => {
+              // decodeAudioData won’t decode raw PCM16; we implement a tiny player below
+            }).catch(() => {
+              // Manual PCM16 playback
+              const buf = evt.data;
+              const view = new DataView(buf);
+              const samples = new Int16Array(buf.byteLength / 2);
+              for (let i = 0; i < samples.length; i++) samples[i] = view.getInt16(i * 2, true);
+              // Convert to Float32 [-1,1]
+              const f32 = new Float32Array(samples.length);
+              for (let i = 0; i < samples.length; i++) f32[i] = samples[i] / 32768;
+              // Push to an AudioBufferSourceNode
+              const ctx = audioCtx || new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+              audioCtx = ctx;
+              const audioBuf = ctx.createBuffer(1, f32.length, 16000);
+              audioBuf.copyToChannel(f32, 0, 0);
+              const src = ctx.createBufferSource();
+              src.buffer = audioBuf;
+              src.connect(ctx.destination);
+              src.start();
+            });
+            return;
+          }
+          // Text = status/transcripts
+          try {
+            const msg = JSON.parse(typeof evt.data === 'string' ? evt.data : new TextDecoder().decode(evt.data));
+            if (msg.type === 'status') log('[status]', msg.text || '');
+            if (msg.type === 'settings') log('[settings]', msg);
+            if (msg.type === 'transcript') log(`[${msg.role}]`, msg.text);
+          } catch {
+            log('[text]', evt.data);
+          }
+        };
+
+        // Mic
+        mediaStream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, noiseSuppression: true, echoCancellation: true }, video: false });
+        const tracks = mediaStream.getAudioTracks();
+        document.getElementById('micInfo').textContent = tracks.length ? (tracks[0].label || 'microphone') : 'mic on';
+
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        sourceNode = audioCtx.createMediaStreamSource(mediaStream);
+
+        const proc = audioCtx.createScriptProcessor(4096, 1, 1);
+        sourceNode.connect(proc);
+        proc.connect(audioCtx.destination); // keep graph alive
+
+        const OUT_RATE = 16000;
+        const FRAME_SAMPLES = Math.round(OUT_RATE * 0.02); // 20ms
+        let buffer = new Float32Array(0);
+
+        proc.onaudioprocess = (e) => {
+          const input = e.inputBuffer.getChannelData(0);
+          const res = resamplePCM(input, audioCtx.sampleRate, OUT_RATE);
+          // append
+          const combined = new Float32Array(buffer.length + res.length);
+          combined.set(buffer);
+          combined.set(res, buffer.length);
+          buffer = combined;
+
+          while (buffer.length >= FRAME_SAMPLES) {
+            const frame = buffer.slice(0, FRAME_SAMPLES);
+            buffer = buffer.slice(FRAME_SAMPLES);
+            const ab = floatTo16BitPCM(frame);
+            if (ws && ws.readyState === WebSocket.OPEN) ws.send(ab);
+          }
+        };
+
+        document.getElementById('btnStart').disabled = true;
+        document.getElementById('btnStop').disabled = false;
+      } catch (e) {
+        setStatus('error');
+        log('start error', e?.message || e);
+      }
+    }
+
+    async function stop() {
+      try {
+        if (ws && ws.readyState === WebSocket.OPEN) ws.close(1000);
+        if (sourceNode) { try { sourceNode.disconnect(); } catch {} }
+        if (audioCtx) { try { audioCtx.close(); } catch {} }
+        if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
+      } finally {
+        ws = null; sourceNode = null; audioCtx = null; mediaStream = null;
+        document.getElementById('btnStart').disabled = false;
+        document.getElementById('btnStop').disabled = true;
+        setStatus('idle');
+      }
+    }
+
+    document.getElementById('btnStart').onclick = start;
+    document.getElementById('btnStop').onclick = stop;
+  </script>
+</body>
+</html>
