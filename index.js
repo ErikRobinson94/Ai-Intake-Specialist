@@ -16,7 +16,7 @@ const AUDIO_STREAM_ROUTE = process.env.AUDIO_STREAM_ROUTE || '/audio-stream';
 // ---- Health
 app.get('/healthz', (_req, res) => res.type('text/plain').send('ok'));
 
-// ---- Twilio webhook (robust resolver)
+// ---- Twilio webhook (resolve export shape safely)
 let twilioVoiceHandler = null;
 try {
   const twilioModule = require('./lib/twilioHandler');
@@ -44,18 +44,22 @@ app.get('/', (_req, res) => {
   res.sendFile(path.join(STATIC_DIR, 'index.html'));
 });
 
-// Optional: catch-all so any non-API route serves the Next index (prevents "Cannot GET /")
+// Catch-all to serve the SPA index for non-API routes
 app.get('*', (req, res, next) => {
-  // don’t swallow API/WS routes
   const p = req.path || '';
-  if (p.startsWith('/twilio/') || p.startsWith('/healthz') || p.startsWith(AUDIO_STREAM_ROUTE)) return next();
+  if (
+    p.startsWith('/twilio/') ||
+    p === '/healthz' ||
+    p.startsWith(AUDIO_STREAM_ROUTE) ||
+    p.startsWith('/web-demo/ws')
+  ) return next();
   res.sendFile(path.join(STATIC_DIR, 'index.html'));
 });
 
 // ---- HTTP server + websockets
 const server = http.createServer(app);
 
-// Twilio <Stream> ↔ Deepgram Agent bridge (phone)
+// Twilio <Stream> ↔ Deepgram Agent bridge (phone calls)
 const { setupAudioStream } = require('./lib/audio-stream');
 setupAudioStream(server, { route: AUDIO_STREAM_ROUTE });
 

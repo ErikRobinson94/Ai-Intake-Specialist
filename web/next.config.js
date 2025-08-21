@@ -1,12 +1,12 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  // Enable static HTML export (replaces `npx next export`)
+  // Next 14+ static HTML export
   output: 'export',
 
-  // Ensure images work in static export mode
+  // Needed when exporting to static HTML
   images: { unoptimized: true },
 
-  // Keep clean URLs (no trailing slash). Change to `true` if you prefer `/index.html` style.
+  // Keep clean URLs
   trailingSlash: false,
 };
 
