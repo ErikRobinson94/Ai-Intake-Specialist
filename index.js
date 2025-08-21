@@ -10,28 +10,24 @@ app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 app.use(morgan(process.env.LOG_LEVEL === 'debug' ? 'dev' : 'tiny'));
 
-// ---- ENV ----
 const PORT = process.env.PORT || 5002;
-const HOSTNAME = process.env.HOSTNAME || 'localhost';
 const AUDIO_STREAM_ROUTE = process.env.AUDIO_STREAM_ROUTE || '/audio-stream';
 
-// ---- HEALTH ----
+// ---- health
 app.get('/healthz', (_req, res) => res.type('text/plain').send('ok'));
 
-// ---- TWILIO VOICE WEBHOOK (robust resolver) ----
+// ---- Twilio webhook
 let twilioVoiceHandler = null;
 try {
   const twilioModule = require('./lib/twilioHandler');
-  // support any export style
   twilioVoiceHandler =
     (typeof twilioModule === 'function' ? twilioModule : null) ||
     twilioModule?.twilioVoiceHandler ||
     twilioModule?.voiceHandler ||
     twilioModule?.handler ||
     twilioModule?.default;
-
   if (typeof twilioVoiceHandler !== 'function') {
-    console.error('[startup] Could not resolve a function export from lib/twilioHandler.js. Falling back to 500 handler.');
+    console.error('[startup] twilioHandler export not a function; using 500 fallback');
     twilioVoiceHandler = (_req, res) => res.status(500).type('text/plain').send('twilio handler not configured');
   }
 } catch (e) {
@@ -40,21 +36,21 @@ try {
 }
 app.post('/twilio/voice', twilioVoiceHandler);
 
-// ---- STATIC WEB DEMO (serve at "/") ----
-const STATIC_DIR = path.join(__dirname, 'web', 'public');
+// ---- Serve the exported Next.js site at "/"
+const STATIC_DIR = path.join(__dirname, 'web', 'out');           // ⟵ changed from web/public
 app.use(express.static(STATIC_DIR));
 app.get('/', (_req, res) => {
   res.sendFile(path.join(STATIC_DIR, 'index.html'));
 });
 
-// ---- HTTP SERVER + WEBSOCKETS ----
+// ---- HTTP server + websockets
 const server = http.createServer(app);
 
-// Twilio <Stream> <-> Deepgram Agent bridge (phone calls)
+// Twilio <Stream> ↔ Deepgram Agent bridge (phone)
 const { setupAudioStream } = require('./lib/audio-stream');
 setupAudioStream(server, { route: AUDIO_STREAM_ROUTE });
 
-// Browser mic <-> Deepgram Agent bridge (NO Twilio)
+// Browser mic ↔ Deepgram Agent bridge (NO Twilio)
 const { setupWebDemoLive } = require('./web-demo-live');
 setupWebDemoLive(server, { route: '/web-demo/ws' });
 
