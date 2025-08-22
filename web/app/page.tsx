@@ -1,292 +1,184 @@
 'use client';
 
-// Make TS happy in client components when reading NEXT_PUBLIC_* envs
-// (Next will inline these at build time; this avoids @types/node in the web app)
-declare const process: any;
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 
-import React, { useEffect, useRef, useState } from 'react';
-
-const WS_URL =
-  (process?.env?.NEXT_PUBLIC_WS_URL as string | undefined) ||
-  `${typeof window !== 'undefined' && window.location.protocol === 'https:' ? 'wss' : 'ws'}://${typeof window !== 'undefined' ? window.location.host : ''}/web-demo/ws`;
-
-type Status = 'idle' | 'connecting' | 'ready' | 'stopped' | 'error';
-type Voice = { id: number; name: string; img: string };
-
-const VOICES: Voice[] = [
-  { id: 1, name: 'Voice 1', img: '/images/voice-m1.png' },
-  { id: 2, name: 'Voice 2', img: '/images/voice-f1.png' },
-  { id: 3, name: 'Voice 3', img: '/images/voice-m2.png' },
-];
+type LogLine = { t: string; level?: 'info' | 'warn' | 'error' };
 
 export default function Page() {
-  const [status, setStatus] = useState<Status>('idle');
   const [voiceId, setVoiceId] = useState<number>(2);
-  const [transcripts, setTranscripts] = useState<string[]>([]);
-  const [mics, setMics] = useState<MediaDeviceInfo[]>([]);
-  const [micId, setMicId] = useState<string>('');
-
+  const [status, setStatus] = useState<'idle' | 'connecting' | 'connected' | 'error'>('idle');
+  const [logs, setLogs] = useState<LogLine[]>([{ t: 'System: Ready (click Start)' }]);
   const wsRef = useRef<WebSocket | null>(null);
-  const acRef = useRef<AudioContext | null>(null);
-  const micStreamRef = useRef<MediaStream | null>(null);
-  const micNodeRef = useRef<AudioWorkletNode | null>(null);
-  const playerNodeRef = useRef<AudioWorkletNode | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
 
-  useEffect(() => {
-    (async () => {
-      try {
-        await navigator.mediaDevices.getUserMedia({ audio: true });
-      } catch {}
-      try {
-        const all = await navigator.mediaDevices.enumerateDevices();
-        const micList = all.filter((d) => d.kind === 'audioinput');
-        setMics(micList);
-        if (!micId && micList[0]) setMicId(micList[0].deviceId);
-      } catch {}
-    })();
-    return () => stopEverything(true);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+  const log = useCallback((t: string, level: LogLine['level'] = 'info') => {
+    setLogs((prev) => [...prev, { t, level }]);
+    // Also mirror to console for deep debugging
+    if (level === 'error') console.error(t);
+    else if (level === 'warn') console.warn(t);
+    else console.log(t);
   }, []);
 
-  function pushTranscript(line: string) {
-    setTranscripts((prev) => (prev.length > 200 ? prev.slice(-200).concat(line) : prev.concat(line)));
-  }
+  const computeWsUrl = useCallback(() => {
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    // Always talk to our server; it routes ws correctly on Render
+    return `${proto}://${location.host}/web-demo/ws?voiceId=${voiceId}`;
+  }, [voiceId]);
 
-  async function ensureAudioContext(): Promise<AudioContext> {
-    if (acRef.current) {
-      await acRef.current.resume().catch(() => {});
-      return acRef.current;
+  const start = useCallback(async () => {
+    if (status === 'connected' || status === 'connecting') return;
+
+    setStatus('connecting');
+    log(`Requesting mic permission…`);
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      streamRef.current = stream;
+      log(`Mic permission granted.`);
+    } catch (err) {
+      setStatus('error');
+      log(`Mic permission denied: ${String(err)}`, 'error');
+      return;
     }
-    const ac = new (window.AudioContext || (window as any).webkitAudioContext)();
-    acRef.current = ac;
-    await ac.resume().catch(() => {});
-    return ac;
-  }
 
-  async function setupPlayback(ac: AudioContext) {
-    if (playerNodeRef.current) return playerNodeRef.current;
-    await ac.audioWorklet.addModule('/worklets/pcm-player.js');
-    const node = new AudioWorkletNode(ac, 'pcm-player');
-    node.connect(ac.destination);
-    playerNodeRef.current = node;
-    return node;
-  }
+    const url = computeWsUrl();
+    log(`Connecting WS → ${url}`);
+    const ws = new WebSocket(url);
+    wsRef.current = ws;
 
-  async function setupMic(ac: AudioContext) {
-    if (micNodeRef.current) return micNodeRef.current;
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: micId ? { deviceId: { exact: micId } } : true,
-      video: false,
-    });
-    micStreamRef.current = stream;
-    const src = ac.createMediaStreamSource(stream);
-    await ac.audioWorklet.addModule('/worklets/pcm-processor.js');
-    const node = new AudioWorkletNode(ac, 'pcm-processor', {
-      processorOptions: { targetSampleRate: ac.sampleRate },
-    });
-    src.connect(node);
-    micNodeRef.current = node;
-    return node;
-  }
+    const timer = setTimeout(() => {
+      if (ws.readyState !== WebSocket.OPEN) {
+        setStatus('error');
+        log('WS connect timed out after 8s', 'error');
+        try { ws.close(); } catch {}
+      }
+    }, 8000);
 
-  function safeCloseWS() {
+    ws.onopen = () => {
+      clearTimeout(timer);
+      setStatus('connected');
+      log('WS open ✔');
+      // send a small heartbeat so we know frames flow
+      ws.send(JSON.stringify({ type: 'ping', t: Date.now() }));
+    };
+
+    ws.onmessage = (ev) => {
+      try {
+        const msg = JSON.parse(ev.data);
+        if (msg.type === 'server_ready') {
+          log(`Server ready (voiceId=${msg.voiceId}). You should now wire up the TTS/ASR pipeline.`);
+          // You can kick off your greeting here using your existing server flow.
+        } else if (msg.type === 'pong') {
+          log('Server pong');
+        } else {
+          log(`Message: ${ev.data}`);
+        }
+      } catch {
+        log(`Binary/unknown frame (${(ev.data as any)?.byteLength ?? 'n/a'} bytes)`);
+      }
+    };
+
+    ws.onclose = (e) => {
+      log(`WS closed (code=${e.code}, reason=${e.reason || 'no-reason'})`, 'warn');
+      setStatus('idle');
+    };
+
+    ws.onerror = (e) => {
+      log(`WS error: ${String(e)}`, 'error');
+      setStatus('error');
+    };
+  }, [computeWsUrl, log, status]);
+
+  const stop = useCallback(() => {
     try {
       wsRef.current?.close();
     } catch {}
     wsRef.current = null;
-  }
-
-  function stopEverything(silent = false) {
-    try {
-      micNodeRef.current?.disconnect();
-    } catch {}
-    micNodeRef.current = null;
-
-    micStreamRef.current?.getTracks().forEach((t) => t.stop());
-    micStreamRef.current = null;
-
-    try {
-      playerNodeRef.current?.disconnect();
-    } catch {}
-    playerNodeRef.current = null;
-
-    if (acRef.current) acRef.current.suspend().catch(() => {});
-
-    safeCloseWS();
-    if (!silent) setStatus('stopped');
-  }
-
-  async function handleStart() {
-    if (status === 'connecting' || status === 'ready') return;
-    setStatus('connecting');
-
-    try {
-      const ac = await ensureAudioContext();
-      const player = await setupPlayback(ac);
-      const micNode = await setupMic(ac);
-
-      const url = `${WS_URL}?voiceId=${encodeURIComponent(String(voiceId))}`;
-      const ws = new WebSocket(url);
-      ws.binaryType = 'arraybuffer';
-      wsRef.current = ws;
-
-      ws.onopen = () => {
-        setStatus('ready');
-        pushTranscript(`System: Connected (voiceId=${voiceId}).`);
-      };
-
-      ws.onerror = (e) => {
-        console.error('WS error', e);
-        pushTranscript('System: WebSocket error.');
-        setStatus('error');
-      };
-
-      ws.onclose = () => {
-        pushTranscript('System: Disconnected.');
-        setStatus((s) => (s === 'error' ? 'error' : 'stopped'));
-      };
-
-      ws.onmessage = (evt) => {
-        if (typeof evt.data === 'string') {
-          try {
-            const msg = JSON.parse(evt.data);
-            if (msg?.type === 'transcript' && msg.text) pushTranscript(msg.text);
-            else if (msg?.status) pushTranscript(`System: ${msg.status}`);
-            else if (msg?.text) pushTranscript(String(msg.text));
-            else pushTranscript(String(evt.data));
-          } catch {
-            pushTranscript(String(evt.data));
-          }
-          return;
-        }
-        // Audio chunk (PCM16)
-        try {
-          const buf = evt.data as ArrayBuffer;
-          player.port.postMessage({ type: 'play', pcm16: buf });
-        } catch (e) {
-          console.warn('Failed to play audio chunk', e);
-        }
-      };
-
-      micNode.port.onmessage = (ev) => {
-        if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
-        const f32 = ev.data?.samples as Float32Array | undefined;
-        if (!f32) return;
-        const i16 = new Int16Array(f32.length);
-        for (let i = 0; i < f32.length; i++) {
-          const s = Math.max(-1, Math.min(1, f32[i]));
-          i16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
-        }
-        wsRef.current.send(i16.buffer);
-      };
-    } catch (err: any) {
-      console.error(err);
-      pushTranscript(`System: ${err?.message || 'Failed to initialize audio/WS.'}`);
-      setStatus('error');
-      stopEverything(true);
+    if (streamRef.current) {
+      for (const t of streamRef.current.getTracks()) t.stop();
+      streamRef.current = null;
     }
-  }
+    setStatus('idle');
+    log('Stopped.');
+  }, [log]);
 
-  function handleStop() {
-    stopEverything();
-  }
+  useEffect(() => {
+    return () => stop();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   return (
-    <div className="min-h-screen w-full bg-neutral-950 text-white">
-      <div className="mx-auto max-w-6xl px-6 py-10">
-        <div className="mb-8 flex items-center gap-3">
-          <div className="text-emerald-400 text-2xl font-semibold">CASE CONNECT</div>
-          <div className="ml-auto text-sm rounded-full px-2 py-1 bg-neutral-800">
-            {status}
-          </div>
-        </div>
+    <main className="min-h-screen bg-[#0f0f10] text-white">
+      <div className="max-w-6xl mx-auto p-6 grid grid-cols-1 md:grid-cols-3 gap-6">
+        <div className="md:col-span-2 space-y-6">
+          <div className="rounded-2xl border border-[#222] p-6 shadow-lg">
+            <div className="flex items-center gap-3 mb-4">
+              <div className="h-8 w-8 rounded-full bg-emerald-500/20 grid place-items-center">
+                <span className="text-emerald-400 font-bold">C</span>
+              </div>
+              <h1 className="text-xl font-semibold">CASE CONNECT</h1>
+              <span className="ml-2 text-sm text-gray-400">status: {status}</span>
+            </div>
 
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-10">
-          <div className="rounded-2xl bg-neutral-900 p-8 shadow-xl">
-            <h1 className="text-3xl font-bold">
-              Demo our <span className="text-amber-400">AI intake</span> experience
-            </h1>
-            <p className="mt-2 text-neutral-300">
-              Speak with our virtual assistant and experience a legal intake done right.
-            </p>
+            <h2 className="text-2xl font-bold text-amber-400 mb-2">Demo our AI intake experience</h2>
+            <p className="text-gray-300">Speak with our virtual assistant and experience a legal intake done right.</p>
 
             <div className="mt-6">
               <button
-                onClick={handleStart}
-                disabled={status === 'connecting' || status === 'ready'}
-                className="rounded-xl bg-amber-500 px-6 py-3 font-semibold text-black disabled:opacity-60"
+                onClick={start}
+                disabled={status === 'connecting' || status === 'connected'}
+                className="rounded-2xl bg-amber-500 hover:bg-amber-600 px-5 py-3 font-semibold disabled:opacity-50"
               >
                 Speak with AI Assistant
               </button>
-              <button
-                onClick={handleStop}
-                disabled={status !== 'ready' && status !== 'connecting'}
-                className="ml-3 rounded-xl bg-neutral-800 px-4 py-3"
-              >
-                Stop
-              </button>
             </div>
 
-            <div className="mt-10">
-              <div className="mb-3 font-semibold text-neutral-200">Choose a voice to sample</div>
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-5">
-                {VOICES.map((v) => (
+            <div className="mt-8">
+              <h3 className="font-semibold mb-3">Choose a voice to sample</h3>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                {[1, 2, 3].map((id) => (
                   <button
-                    key={v.id}
-                    onClick={() => setVoiceId(v.id)}
-                    className={`rounded-2xl bg-neutral-800 p-4 text-center ring-2 ${
-                      voiceId === v.id ? 'ring-amber-500' : 'ring-transparent'
+                    key={id}
+                    onClick={() => setVoiceId(id)}
+                    className={`rounded-xl border p-3 text-center ${
+                      voiceId === id ? 'border-amber-500' : 'border-[#222]'
                     }`}
                   >
                     <img
-                      src={v.img}
-                      alt={v.name}
-                      className="mx-auto h-44 w-full object-cover rounded-xl"
-                      draggable={false}
+                      src={`/images/${id === 1 ? 'voice-m1' : id === 2 ? 'voice-f1' : 'voice-m2'}.png`}
+                      alt={`Voice ${id}`}
+                      className="rounded-lg mb-2"
                     />
-                    <div className="mt-2 text-sm text-neutral-300">{v.name}</div>
+                    <div className="text-sm text-gray-300">Voice {id}</div>
                   </button>
                 ))}
               </div>
             </div>
-
-            <div className="mt-8">
-              <div className="mb-2 text-sm text-neutral-300">Microphone</div>
-              <select
-                className="w-full rounded-lg bg-neutral-800 p-2"
-                value={micId}
-                onChange={(e) => setMicId(e.target.value)}
-              >
-                {mics.length === 0 && <option>Default microphone</option>}
-                {mics.map((m) => (
-                  <option key={m.deviceId} value={m.deviceId}>
-                    {m.label || `Mic ${m.deviceId.slice(0, 6)}`}
-                  </option>
-                ))}
-              </select>
-            </div>
-
-            <div className="mt-4 text-xs text-neutral-400">
-              WS: <code className="break-words">{WS_URL}?voiceId={voiceId}</code>
-            </div>
           </div>
+        </div>
 
-          <div className="rounded-2xl bg-neutral-900 p-6 shadow-xl">
-            <div className="mb-3 font-semibold">Conversation</div>
-            <div className="h-[520px] overflow-auto rounded-xl bg-neutral-950 p-4 text-sm">
-              {transcripts.length === 0 ? (
-                <div className="text-neutral-500">System: Initializing… chosen avatar voiceId={voiceId}</div>
-              ) : (
-                transcripts.map((t, i) => (
-                  <div key={i} className="mb-2 whitespace-pre-wrap">
-                    {t}
-                  </div>
-                ))
-              )}
-            </div>
+        <div className="md:col-span-1 rounded-2xl border border-[#222] p-4 shadow-lg flex flex-col">
+          <h3 className="font-semibold mb-2">Conversation</h3>
+          <div className="flex-1 overflow-auto rounded-lg bg-black/30 p-3 text-sm">
+            {logs.map((l, i) => (
+              <div key={i} className={l.level === 'error' ? 'text-red-400' : l.level === 'warn' ? 'text-amber-400' : ''}>
+                {l.t}
+              </div>
+            ))}
+          </div>
+          <div className="mt-3 flex gap-3">
+            <button
+              onClick={start}
+              disabled={status === 'connecting' || status === 'connected'}
+              className="flex-1 rounded-xl bg-amber-500 hover:bg-amber-600 px-4 py-2 font-semibold disabled:opacity-50"
+            >
+              Start
+            </button>
+            <button onClick={stop} className="rounded-xl bg-zinc-800 hover:bg-zinc-700 px-4 py-2">
+              Stop
+            </button>
           </div>
         </div>
       </div>
-    </div>
+    </main>
   );
 }
