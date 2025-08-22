@@ -4,7 +4,7 @@
 // Avatar voice is chosen via ?voiceId=1|2|3 -> VOICE_{id}_TTS (fallback DG_TTS_VOICE).
 
 const WebSocket = require("ws");
-const bus = require("./web-demo-bus");
+const bus = undefined; // optional event bus (removed to avoid extra deps)
 
 // tiny helpers (same shaping as phone bridge)
 function sanitizeASCII(str) {
@@ -22,7 +22,21 @@ function compact(s, max = 380) {
 }
 
 function setupWebDemoLive(server, { route = "/web-demo/ws" } = {}) {
-  const wss = new WebSocket.Server({ server, path: route, perMessageDeflate: false });
+  // IMPORTANT: use noServer to avoid double-upgrade with other WS routes.
+  const wss = new WebSocket.Server({ noServer: true, perMessageDeflate: false });
+
+  // Single guarded upgrade for this route only
+  server.on("upgrade", (req, socket, head) => {
+    try {
+      const { pathname } = new URL(req.url, "http://localhost");
+      if (pathname !== route) return; // not our route
+      wss.handleUpgrade(req, socket, head, (ws) => {
+        wss.emit("connection", ws, req);
+      });
+    } catch {
+      // if URL parsing fails, ignore; let other handlers consider it
+    }
+  });
 
   wss.on("connection", (browserWS, req) => {
     let closed = false;
@@ -93,7 +107,6 @@ function setupWebDemoLive(server, { route = "/web-demo/ws" } = {}) {
       try {
         agentWS.send(JSON.stringify(settings));
         settingsSent = true;
-        // tell the UI exactly what we applied
         try {
           browserWS.send(JSON.stringify({
             type: "settings",
@@ -108,7 +121,6 @@ function setupWebDemoLive(server, { route = "/web-demo/ws" } = {}) {
 
     agentWS.on("open", () => {
       try { browserWS.send(JSON.stringify({ type: "status", text: "Connected to Deepgram." })); } catch {}
-      bus?.emit("status", "Web demo connected to Deepgram.");
       sendSettings();
     });
 
@@ -155,16 +167,12 @@ function setupWebDemoLive(server, { route = "/web-demo/ws" } = {}) {
 
           case "SettingsApplied":
             settingsApplied = true;
-            // flush preroll
             if (preFrames.length) {
-              try {
-                for (const fr of preFrames) agentWS.send(fr);
-              } catch {}
+              try { for (const fr of preFrames) agentWS.send(fr); } catch {}
               preFrames.length = 0;
             }
             break;
 
-          // grab a broad set of transcript events
           case "ConversationText":
           case "History":
           case "UserTranscript":
@@ -204,7 +212,6 @@ function setupWebDemoLive(server, { route = "/web-demo/ws" } = {}) {
     agentWS.on("close", () => {
       clearInterval(keepalive); clearInterval(meter);
       try { browserWS.send(JSON.stringify({ type: "status", text: "Deepgram connection closed." })); } catch {}
-      bus?.emit("status", "Web demo Deepgram closed.");
       safeClose();
     });
 
