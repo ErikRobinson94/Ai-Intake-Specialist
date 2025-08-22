@@ -1,352 +1,292 @@
-"use client";
+'use client';
 
-import { useEffect, useRef, useState } from "react";
-import Image from "next/image";
+// Make TS happy in client components when reading NEXT_PUBLIC_* envs
+// (Next will inline these at build time; this avoids @types/node in the web app)
+declare const process: any;
 
-// Resolve the WS base dynamically so it works locally and on Render.
-// If NEXT_PUBLIC_WS_URL is set, we use it (e.g., wss://api.onrender.com/web-demo/ws).
-// Otherwise we derive from the current host (e.g., ws://localhost:5002/web-demo/ws).
-function getWSBase(): string {
-  const env = process.env.NEXT_PUBLIC_WS_URL; // baked at build time if provided
-  if (env && typeof env === "string" && env.length) return env;
+import React, { useEffect, useRef, useState } from 'react';
 
-  if (typeof window === "undefined") return ""; // SSR safeguard; computed on client
-  const scheme = window.location.protocol === "https:" ? "wss" : "ws";
-  return `${scheme}://${window.location.host}/web-demo/ws`;
-}
+const WS_URL =
+  (process?.env?.NEXT_PUBLIC_WS_URL as string | undefined) ||
+  `${typeof window !== 'undefined' && window.location.protocol === 'https:' ? 'wss' : 'ws'}://${typeof window !== 'undefined' ? window.location.host : ''}/web-demo/ws`;
 
-type Voice = { id: number; name: string; src: string; scale?: string };
-type Msg = { role: "User" | "Agent" | "System"; text: string; id: string };
-type Payload =
-  | { type: "transcript"; role: "User" | "Agent"; text: string; partial?: boolean }
-  | { type: "status"; text: string }
-  | {
-      type: "settings";
-      sttModel: string;
-      ttsVoice: string;
-      llmModel: string;
-      temperature: number;
-      greeting: string;
-      prompt_len: number;
-    };
+type Status = 'idle' | 'connecting' | 'ready' | 'stopped' | 'error';
+type Voice = { id: number; name: string; img: string };
 
 const VOICES: Voice[] = [
-  { id: 1, name: "Voice 1", src: "/images/voice-m1.png", scale: "scale-[1.12]" },
-  { id: 2, name: "Voice 2", src: "/images/voice-f1.png" },
-  { id: 3, name: "Voice 3", src: "/images/voice-m2.png" },
+  { id: 1, name: 'Voice 1', img: '/images/voice-m1.png' },
+  { id: 2, name: 'Voice 2', img: '/images/voice-f1.png' },
+  { id: 3, name: 'Voice 3', img: '/images/voice-m2.png' },
 ];
 
-// resample 16k -> ctx rate
-function resampleFloat(input: Float32Array, inRate: number, outRate: number): Float32Array {
-  if (inRate === outRate) return input;
-  const outLen = Math.floor((input.length * outRate) / inRate);
-  const out = new Float32Array(outLen);
-  const step = inRate / outRate;
-  let pos = 0;
-  for (let i = 0; i < outLen; i++) {
-    const idx = Math.floor(pos);
-    const frac = pos - idx;
-    const s0 = input[idx] ?? input[input.length - 1];
-    const s1 = input[idx + 1] ?? s0;
-    out[i] = s0 + (s1 - s0) * frac;
-    pos += step;
-  }
-  return out;
-}
-
-export default function Home() {
-  const [selected, setSelected] = useState<number>(2);
-  const [transcript, setTranscript] = useState<Msg[]>([]);
-  const [partialAgent, setPartialAgent] = useState("");
-  const [partialUser, setPartialUser] = useState("");
-  const [status, setStatus] = useState<"idle" | "connecting" | "live" | "stopped">("idle");
+export default function Page() {
+  const [status, setStatus] = useState<Status>('idle');
+  const [voiceId, setVoiceId] = useState<number>(2);
+  const [transcripts, setTranscripts] = useState<string[]>([]);
+  const [mics, setMics] = useState<MediaDeviceInfo[]>([]);
+  const [micId, setMicId] = useState<string>('');
 
   const wsRef = useRef<WebSocket | null>(null);
-  const audioCtxRef = useRef<AudioContext | null>(null);
-  const micWorkletRef = useRef<AudioWorkletNode | null>(null);
-  const playerWorkletRef = useRef<AudioWorkletNode | null>(null);
-  const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
-  const endRef = useRef<HTMLDivElement | null>(null);
-
-  useEffect(() => () => stopDemo(), []);
+  const acRef = useRef<AudioContext | null>(null);
+  const micStreamRef = useRef<MediaStream | null>(null);
+  const micNodeRef = useRef<AudioWorkletNode | null>(null);
+  const playerNodeRef = useRef<AudioWorkletNode | null>(null);
 
   useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [transcript.length, partialAgent, partialUser]);
-
-  const addMsg = (role: Msg["role"], text: string) =>
-    setTranscript((prev) => [...prev, { role, text, id: crypto.randomUUID() }]);
-
-  async function ensureAudioContext() {
-    if (audioCtxRef.current) return audioCtxRef.current;
-    const Ctx = (window as any).AudioContext || (window as any).webkitAudioContext;
-    const ctx: AudioContext = new Ctx();
-    if (ctx.state === "suspended") {
+    (async () => {
       try {
-        await ctx.resume();
+        await navigator.mediaDevices.getUserMedia({ audio: true });
       } catch {}
-    }
-    audioCtxRef.current = ctx;
-    return ctx;
+      try {
+        const all = await navigator.mediaDevices.enumerateDevices();
+        const micList = all.filter((d) => d.kind === 'audioinput');
+        setMics(micList);
+        if (!micId && micList[0]) setMicId(micList[0].deviceId);
+      } catch {}
+    })();
+    return () => stopEverything(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  function pushTranscript(line: string) {
+    setTranscripts((prev) => (prev.length > 200 ? prev.slice(-200).concat(line) : prev.concat(line)));
   }
 
-  async function startDemo() {
-    try {
-      setTranscript([]);
-      setPartialAgent("");
-      setPartialUser("");
-      setStatus("connecting");
-
-      // WS — pass avatar choice in query
-      const base = getWSBase();
-      const url = `${base}${base.includes("?") ? "&" : "?"}voiceId=${selected}`;
-      const ws = new WebSocket(url);
-      ws.binaryType = "arraybuffer";
-      wsRef.current = ws;
-
-      ws.onopen = () => {
-        setStatus("live");
-        addMsg("System", `Initializing… chosen avatar voiceId=${selected}`);
-      };
-      ws.onclose = () => setStatus("stopped");
-      ws.onerror = () => setStatus("stopped");
-
-      ws.onmessage = async (ev) => {
-        if (ev.data instanceof ArrayBuffer) {
-          // Agent TTS PCM16 @16k -> Float32 -> resample -> play
-          const pcm16 = new Int16Array(ev.data);
-          const f16 = new Float32Array(pcm16.length);
-          for (let i = 0; i < pcm16.length; i++) f16[i] = Math.max(-1, Math.min(1, pcm16[i] / 0x8000));
-          const ctx = await ensureAudioContext();
-          const out = resampleFloat(f16, 16000, ctx.sampleRate);
-          playerWorkletRef.current?.port.postMessage(out.buffer, [out.buffer]);
-          return;
-        }
-
-        try {
-          const payload: Payload = JSON.parse(ev.data as string);
-
-          if (payload.type === "transcript") {
-            const { role, text, partial } = payload;
-            if (partial) {
-              if (role === "Agent") setPartialAgent(text);
-              else setPartialUser(text);
-            } else {
-              if (role === "Agent") setPartialAgent("");
-              else setPartialUser("");
-              addMsg(role, text); // append final
-            }
-            return;
-          }
-
-          if (payload.type === "status") {
-            addMsg("System", payload.text);
-            return;
-          }
-
-          if (payload.type === "settings") {
-            addMsg(
-              "System",
-              `Settings: STT=${payload.sttModel}, TTS=${payload.ttsVoice}, LLM=${payload.llmModel} (T=${payload.temperature}). Greeting="${payload.greeting}". Prompt chars=${payload.prompt_len}.`
-            );
-            return;
-          }
-        } catch {}
-      };
-
-      // Audio
-      const ctx = await ensureAudioContext();
-      await ctx.audioWorklet.addModule("/worklets/pcm-processor.js");
-      await ctx.audioWorklet.addModule("/worklets/pcm-player.js");
-
-      const player = new AudioWorkletNode(ctx, "pcm-player");
-      player.connect(ctx.destination);
-      playerWorkletRef.current = player;
-
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-        video: false,
-      });
-      const srcNode = ctx.createMediaStreamSource(stream);
-      sourceRef.current = srcNode;
-
-      const micNode = new AudioWorkletNode(ctx, "pcm-processor"); // emits Int16 @16k, 20ms frames
-      micWorkletRef.current = micNode;
-
-      // keep mic graph connected but silent
-      const silence = ctx.createGain();
-      silence.gain.value = 0;
-      micNode.connect(silence).connect(ctx.destination);
-
-      micNode.port.onmessage = (e) => {
-        const arrbuf = e.data as ArrayBuffer;
-        if (ws.readyState === WebSocket.OPEN) ws.send(arrbuf);
-      };
-
-      srcNode.connect(micNode);
-    } catch {
-      setStatus("stopped");
+  async function ensureAudioContext(): Promise<AudioContext> {
+    if (acRef.current) {
+      await acRef.current.resume().catch(() => {});
+      return acRef.current;
     }
+    const ac = new (window.AudioContext || (window as any).webkitAudioContext)();
+    acRef.current = ac;
+    await ac.resume().catch(() => {});
+    return ac;
   }
 
-  function stopDemo() {
+  async function setupPlayback(ac: AudioContext) {
+    if (playerNodeRef.current) return playerNodeRef.current;
+    await ac.audioWorklet.addModule('/worklets/pcm-player.js');
+    const node = new AudioWorkletNode(ac, 'pcm-player');
+    node.connect(ac.destination);
+    playerNodeRef.current = node;
+    return node;
+  }
+
+  async function setupMic(ac: AudioContext) {
+    if (micNodeRef.current) return micNodeRef.current;
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: micId ? { deviceId: { exact: micId } } : true,
+      video: false,
+    });
+    micStreamRef.current = stream;
+    const src = ac.createMediaStreamSource(stream);
+    await ac.audioWorklet.addModule('/worklets/pcm-processor.js');
+    const node = new AudioWorkletNode(ac, 'pcm-processor', {
+      processorOptions: { targetSampleRate: ac.sampleRate },
+    });
+    src.connect(node);
+    micNodeRef.current = node;
+    return node;
+  }
+
+  function safeCloseWS() {
     try {
       wsRef.current?.close();
     } catch {}
     wsRef.current = null;
+  }
+
+  function stopEverything(silent = false) {
     try {
-      micWorkletRef.current?.port?.close?.();
+      micNodeRef.current?.disconnect();
     } catch {}
+    micNodeRef.current = null;
+
+    micStreamRef.current?.getTracks().forEach((t) => t.stop());
+    micStreamRef.current = null;
+
     try {
-      playerWorkletRef.current?.disconnect();
+      playerNodeRef.current?.disconnect();
     } catch {}
+    playerNodeRef.current = null;
+
+    if (acRef.current) acRef.current.suspend().catch(() => {});
+
+    safeCloseWS();
+    if (!silent) setStatus('stopped');
+  }
+
+  async function handleStart() {
+    if (status === 'connecting' || status === 'ready') return;
+    setStatus('connecting');
+
     try {
-      sourceRef.current?.disconnect();
-    } catch {}
-    try {
-      audioCtxRef.current?.close();
-    } catch {}
-    micWorkletRef.current = null;
-    playerWorkletRef.current = null;
-    sourceRef.current = null;
-    audioCtxRef.current = null;
-    setStatus("stopped");
+      const ac = await ensureAudioContext();
+      const player = await setupPlayback(ac);
+      const micNode = await setupMic(ac);
+
+      const url = `${WS_URL}?voiceId=${encodeURIComponent(String(voiceId))}`;
+      const ws = new WebSocket(url);
+      ws.binaryType = 'arraybuffer';
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        setStatus('ready');
+        pushTranscript(`System: Connected (voiceId=${voiceId}).`);
+      };
+
+      ws.onerror = (e) => {
+        console.error('WS error', e);
+        pushTranscript('System: WebSocket error.');
+        setStatus('error');
+      };
+
+      ws.onclose = () => {
+        pushTranscript('System: Disconnected.');
+        setStatus((s) => (s === 'error' ? 'error' : 'stopped'));
+      };
+
+      ws.onmessage = (evt) => {
+        if (typeof evt.data === 'string') {
+          try {
+            const msg = JSON.parse(evt.data);
+            if (msg?.type === 'transcript' && msg.text) pushTranscript(msg.text);
+            else if (msg?.status) pushTranscript(`System: ${msg.status}`);
+            else if (msg?.text) pushTranscript(String(msg.text));
+            else pushTranscript(String(evt.data));
+          } catch {
+            pushTranscript(String(evt.data));
+          }
+          return;
+        }
+        // Audio chunk (PCM16)
+        try {
+          const buf = evt.data as ArrayBuffer;
+          player.port.postMessage({ type: 'play', pcm16: buf });
+        } catch (e) {
+          console.warn('Failed to play audio chunk', e);
+        }
+      };
+
+      micNode.port.onmessage = (ev) => {
+        if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+        const f32 = ev.data?.samples as Float32Array | undefined;
+        if (!f32) return;
+        const i16 = new Int16Array(f32.length);
+        for (let i = 0; i < f32.length; i++) {
+          const s = Math.max(-1, Math.min(1, f32[i]));
+          i16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+        }
+        wsRef.current.send(i16.buffer);
+      };
+    } catch (err: any) {
+      console.error(err);
+      pushTranscript(`System: ${err?.message || 'Failed to initialize audio/WS.'}`);
+      setStatus('error');
+      stopEverything(true);
+    }
+  }
+
+  function handleStop() {
+    stopEverything();
   }
 
   return (
-    <main className="min-h-screen w-full px-4 py-10">
-      <div className="mx-auto w-full max-w-7xl grid grid-cols-1 lg:grid-cols-12 gap-8">
-        {/* LEFT */}
-        <section className="lg:col-span-8">
-          <div className="w-full max-w-[520px] lg:max-w-none rounded-3xl bg-zinc-950/80 border border-zinc-800 p-6 shadow-xl mx-auto">
-            <div className="flex items-center gap-3 justify-center">
-              <svg width="34" height="34" viewBox="0 0 24 24" className="text-teal-400">
-                <circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" strokeWidth="2" />
-                <path d="M16 8a6 6 0 1 0 0 8" fill="none" stroke="currentColor" strokeWidth="2" />
-              </svg>
-              <div className="text-xl font-semibold tracking-wide">
-                <span className="text-teal-400">CASE</span> <span className="text-white">CONNECT</span>
-              </div>
-            </div>
+    <div className="min-h-screen w-full bg-neutral-950 text-white">
+      <div className="mx-auto max-w-6xl px-6 py-10">
+        <div className="mb-8 flex items-center gap-3">
+          <div className="text-emerald-400 text-2xl font-semibold">CASE CONNECT</div>
+          <div className="ml-auto text-sm rounded-full px-2 py-1 bg-neutral-800">
+            {status}
+          </div>
+        </div>
 
-            <h1 className="mt-6 text-center text-2xl font-bold text-amber-400">
-              Demo our <span className="font-extrabold">AI</span> intake experience
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-10">
+          <div className="rounded-2xl bg-neutral-900 p-8 shadow-xl">
+            <h1 className="text-3xl font-bold">
+              Demo our <span className="text-amber-400">AI intake</span> experience
             </h1>
-            <p className="mt-2 text-center text-sm text-neutral-300">
+            <p className="mt-2 text-neutral-300">
               Speak with our virtual assistant and experience a legal intake done right.
             </p>
 
-            <div className="mt-5 flex justify-center">
+            <div className="mt-6">
               <button
-                type="button"
-                className="rounded-full bg-amber-500 hover:bg-amber-400 text-black font-medium px-6 py-3 transition"
-                onClick={startDemo}
+                onClick={handleStart}
+                disabled={status === 'connecting' || status === 'ready'}
+                className="rounded-xl bg-amber-500 px-6 py-3 font-semibold text-black disabled:opacity-60"
               >
                 Speak with AI Assistant
               </button>
+              <button
+                onClick={handleStop}
+                disabled={status !== 'ready' && status !== 'connecting'}
+                className="ml-3 rounded-xl bg-neutral-800 px-4 py-3"
+              >
+                Stop
+              </button>
             </div>
 
-            <div className="my-6 h-px w-full bg-zinc-800" />
-
-            <p className="text-center font-medium text-white">Choose a voice to sample</p>
-            <div className="mt-4 grid grid-cols-3 gap-3">
-              {VOICES.map((v) => {
-                const isSel = selected === v.id;
-                return (
+            <div className="mt-10">
+              <div className="mb-3 font-semibold text-neutral-200">Choose a voice to sample</div>
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-5">
+                {VOICES.map((v) => (
                   <button
                     key={v.id}
-                    onClick={() => setSelected(v.id)}
-                    className={[
-                      "group rounded-2xl border bg-zinc-900 p-2 transition",
-                      isSel ? "border-amber-500 ring-2 ring-amber-500/30" : "border-zinc-800",
-                    ].join(" ")}
-                    aria-pressed={isSel}
-                    title={v.name}
+                    onClick={() => setVoiceId(v.id)}
+                    className={`rounded-2xl bg-neutral-800 p-4 text-center ring-2 ${
+                      voiceId === v.id ? 'ring-amber-500' : 'ring-transparent'
+                    }`}
                   >
-                    <div className="relative w-full h-[180px] rounded-xl overflow-hidden bg-black">
-                      <Image
-                        src={v.src}
-                        alt={v.name}
-                        fill
-                        sizes="(max-width: 768px) 100vw, 33vw"
-                        className={["object-contain transition-transform duration-200", v.scale ?? ""].join(" ")}
-                        priority={isSel}
-                        unoptimized
-                      />
-                    </div>
-                    <div className="mt-2 text-center text-xs font-medium">
-                      <span className={isSel ? "text-amber-400" : "text-neutral-300"}>{v.name}</span>
-                    </div>
+                    <img
+                      src={v.img}
+                      alt={v.name}
+                      className="mx-auto h-44 w-full object-cover rounded-xl"
+                      draggable={false}
+                    />
+                    <div className="mt-2 text-sm text-neutral-300">{v.name}</div>
                   </button>
-                );
-              })}
-            </div>
-          </div>
-        </section>
-
-        {/* RIGHT */}
-        <aside className="lg:col-span-4">
-          <div className="rounded-3xl bg-zinc-950/80 border border-zinc-800 shadow-xl h-full flex flex-col">
-            <header className="px-5 py-4 border-b border-zinc-800">
-              <h2 className="text-white font-semibold">Conversation</h2>
-              <p className="text-xs text-neutral-400">
-                {status === "live" ? "Connected." : status === "connecting" ? "Connecting…" : "Live transcript."}
-              </p>
-            </header>
-
-            {/* Scrollable transcript */}
-            <div className="flex-1 px-5 pt-4 space-y-3 overflow-y-auto" style={{ minHeight: 260 }}>
-              {transcript.map((m) => (
-                <div
-                  key={m.id}
-                  className={[
-                    "rounded-2xl px-3 py-2 text-sm w-fit max-w-[90%]",
-                    m.role === "Agent"
-                      ? "bg-zinc-800/60 text-white"
-                      : m.role === "User"
-                      ? "bg-amber-500/90 text-black ml-auto"
-                      : "bg-zinc-700/40 text-neutral-200 mx-auto",
-                  ].join(" ")}
-                >
-                  <span className="font-medium">{m.role}:</span> {m.text}
-                </div>
-              ))}
-
-              {/* live partials */}
-              {partialAgent && (
-                <div className="rounded-2xl px-3 py-2 text-sm w-fit max-w-[90%] bg-zinc-800/40 text-white italic">
-                  <span className="font-medium">Agent:</span> {partialAgent}
-                </div>
-              )}
-              {partialUser && (
-                <div className="rounded-2xl px-3 py-2 text-sm w-fit max-w-[90%] bg-amber-400/70 text-black ml-auto italic">
-                  <span className="font-medium">User:</span> {partialUser}
-                </div>
-              )}
-
-              <div ref={endRef} />
-            </div>
-
-            {/* Footer controls */}
-            <div className="px-5 pb-4 mt-2 border-t border-zinc-800">
-              <div className="flex gap-2">
-                <button
-                  className="w-full rounded-full px-5 py-3 bg-amber-500 text-black text-sm font-medium hover:bg-amber-400 transition"
-                  onClick={startDemo}
-                >
-                  Start
-                </button>
-                <button
-                  className="rounded-full px-5 py-3 border border-zinc-700 text-sm hover:bg-zinc-800 transition"
-                  onClick={stopDemo}
-                >
-                  Stop
-                </button>
+                ))}
               </div>
             </div>
+
+            <div className="mt-8">
+              <div className="mb-2 text-sm text-neutral-300">Microphone</div>
+              <select
+                className="w-full rounded-lg bg-neutral-800 p-2"
+                value={micId}
+                onChange={(e) => setMicId(e.target.value)}
+              >
+                {mics.length === 0 && <option>Default microphone</option>}
+                {mics.map((m) => (
+                  <option key={m.deviceId} value={m.deviceId}>
+                    {m.label || `Mic ${m.deviceId.slice(0, 6)}`}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div className="mt-4 text-xs text-neutral-400">
+              WS: <code className="break-words">{WS_URL}?voiceId={voiceId}</code>
+            </div>
           </div>
-        </aside>
+
+          <div className="rounded-2xl bg-neutral-900 p-6 shadow-xl">
+            <div className="mb-3 font-semibold">Conversation</div>
+            <div className="h-[520px] overflow-auto rounded-xl bg-neutral-950 p-4 text-sm">
+              {transcripts.length === 0 ? (
+                <div className="text-neutral-500">System: Initializing… chosen avatar voiceId={voiceId}</div>
+              ) : (
+                transcripts.map((t, i) => (
+                  <div key={i} className="mb-2 whitespace-pre-wrap">
+                    {t}
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        </div>
       </div>
-    </main>
+    </div>
   );
 }

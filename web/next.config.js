@@ -1,13 +1,10 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  // Next 14+ static HTML export
+  // Static export for Next 14+
   output: 'export',
-
-  // Needed when exporting to static HTML
   images: { unoptimized: true },
-
-  // Keep clean URLs
   trailingSlash: false,
+  reactStrictMode: true,
 };
 
 module.exports = nextConfig;
