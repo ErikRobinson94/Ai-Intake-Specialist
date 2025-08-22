@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: ai-intake-specialist
+    env: node
+    rootDir: .
+    buildCommand: |
+      npm install
+      cd web && npm install && npm run build
+    startCommand: node index.js
+    envVars:
+      - key: PORT
+        value: 5002
+    autoDeploy: true
